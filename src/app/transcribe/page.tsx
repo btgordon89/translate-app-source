@@ -7,7 +7,13 @@ interface TranscriptionResult {
   translatedText?: string;
   language: string;
   timestamp: number;
+  translationService?: string;
   isTranslating?: boolean; // Progressive display: show when translation is in progress
+  serverLatency?: {
+    total: number;
+    whisper: number;
+    translation: number;
+  };
   testMetrics?: {
     chunkSize: number;
     latency: number;
@@ -19,75 +25,101 @@ interface TranscriptionResult {
 export default function TranscribePage() {
   const [isListening, setIsListening] = useState(false);
   const [transcriptions, setTranscriptions] = useState<TranscriptionResult[]>([]);
+  const [currentTranscript, setCurrentTranscript] = useState<TranscriptionResult | null>(null);
   const [error, setError] = useState<string>('');
   const [isLoading, setIsLoading] = useState(false);
   const [audioAnalysisStatus, setAudioAnalysisStatus] = useState<string>('');
   const [isTesting, setIsTesting] = useState(false);
   const [testResults, setTestResults] = useState<any[]>([]);
+  const [translationService, setTranslationService] = useState<'gpt4' | 'google'>('google');
+  const [transcriptionService, setTranscriptionService] = useState<'openai' | 'local'>('openai');
+  const [performanceMode, setPerformanceMode] = useState<'optimized' | 'standard'>('optimized');
+  const [scrollPosition, setScrollPosition] = useState(0);
+
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
-  const transcriptionAreaRef = useRef<HTMLDivElement>(null);
+  const leftPaneRef = useRef<HTMLDivElement>(null);
+  const rightPaneRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const scrollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Auto-scroll to bottom when new transcriptions are added
+  // Teleprompter scrolling effect
   useEffect(() => {
-    if (transcriptionAreaRef.current) {
-      transcriptionAreaRef.current.scrollTop = transcriptionAreaRef.current.scrollHeight;
+    if (isListening) {
+      // Start smooth upward scrolling when listening
+      scrollIntervalRef.current = setInterval(() => {
+        setScrollPosition(prev => prev + 1); // Scroll up 1px every 50ms = 20px/second
+      }, 50);
+    } else {
+      // Stop scrolling when not listening
+      if (scrollIntervalRef.current) {
+        clearInterval(scrollIntervalRef.current);
+        scrollIntervalRef.current = null;
+      }
     }
-  }, [transcriptions]);
+
+    return () => {
+      if (scrollIntervalRef.current) {
+        clearInterval(scrollIntervalRef.current);
+      }
+    };
+  }, [isListening]);
+
+  // Sync scroll position between both panes
+  useEffect(() => {
+    if (leftPaneRef.current) {
+      leftPaneRef.current.scrollTop = scrollPosition;
+    }
+    if (rightPaneRef.current) {
+      rightPaneRef.current.scrollTop = scrollPosition;
+    }
+  }, [scrollPosition]);
 
   // Calculate RMS (Root Mean Square) energy of audio data
   const calculateAudioRMS = async (audioBlob: Blob): Promise<number> => {
     try {
       const arrayBuffer = await audioBlob.arrayBuffer();
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
       
-      // Get audio data from first channel
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      
+      const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
       const channelData = audioBuffer.getChannelData(0);
       
-      // Calculate RMS
-      let sumSquares = 0;
+      let sum = 0;
       for (let i = 0; i < channelData.length; i++) {
-        sumSquares += channelData[i] * channelData[i];
+        sum += channelData[i] * channelData[i];
       }
-      const rms = Math.sqrt(sumSquares / channelData.length);
       
-      // Convert to decibels (approximate)
+      const rms = Math.sqrt(sum / channelData.length);
       const decibels = 20 * Math.log10(rms);
       
-      console.log('🔊 Audio RMS Analysis:', {
-        rms: rms.toFixed(6),
-        decibels: decibels.toFixed(2) + ' dB',
-        duration: audioBuffer.duration.toFixed(2) + 's'
-      });
-      
-      audioContext.close();
       return decibels;
     } catch (error) {
-      console.error('❌ Error calculating audio RMS:', error);
-      return -60; // Default to low value if analysis fails
+      console.warn('Could not calculate audio RMS:', error);
+      return -30; // Default to a reasonable threshold if calculation fails
     }
   };
 
   const startListening = async () => {
     try {
-      setError('');
       setIsLoading(true);
-
-      // Request microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({ 
+      setError('');
+      
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           sampleRate: 16000
-        } 
+        }
       });
       
       streamRef.current = stream;
+      
       const mediaRecorder = new MediaRecorder(stream, {
         mimeType: 'audio/webm; codecs=opus'
       });
@@ -109,18 +141,18 @@ export default function TranscribePage() {
         }
       };
 
-      // Record in 1.5-second chunks for faster response (optimized from 3s)
+      // Record in 1.5-second chunks for maximum speed
       mediaRecorder.start();
       setIsListening(true);
       setIsLoading(false);
 
-      // Set up interval to process audio chunks - optimized for speed
+      // Set up interval to process audio chunks - optimized for maximum speed
       const interval = setInterval(() => {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
           mediaRecorderRef.current.stop();
           mediaRecorderRef.current.start();
         }
-      }, 1500); // Reduced from 3000ms to 1500ms for 50% faster response
+      }, 1500); // 1.5 seconds - maximum speed while maintaining quality
 
       // Store interval for cleanup
       (mediaRecorderRef.current as any).intervalId = interval;
@@ -149,6 +181,12 @@ export default function TranscribePage() {
     }
     
     setIsListening(false);
+    
+    // Finalize current transcript when stopping
+    if (currentTranscript) {
+      setTranscriptions(prev => [...prev, currentTranscript]);
+      setCurrentTranscript(null);
+    }
   };
 
   const sendAudioForTranscription = async (audioBlob: Blob) => {
@@ -181,7 +219,19 @@ export default function TranscribePage() {
       const formData = new FormData();
       formData.append('audio', audioBlob, 'audio.webm');
 
-      const response = await fetch('/api/transcribe', {
+      // Choose API endpoint based on transcription service
+      let apiUrl: string;
+      if (transcriptionService === 'local') {
+        apiUrl = '/api/transcribe-local';
+      } else {
+        // Build optimized API URL based on performance mode
+        apiUrl = `/api/transcribe?translator=${translationService}`;
+        if (performanceMode === 'optimized') {
+          apiUrl += '&format=text&language=en&temperature=0&optimize=true';
+        }
+      }
+      
+      const response = await fetch(apiUrl, {
         method: 'POST',
         body: formData,
       });
@@ -195,25 +245,20 @@ export default function TranscribePage() {
       if (!response.ok) {
         const errorText = await response.text();
         console.error('❌ API Error Response:', errorText);
-        throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errorText}`);
+        throw new Error(`Transcription API error: ${response.status} ${response.statusText}`);
       }
 
       const result = await response.json();
-      console.log('✅ Transcription result:', result);
-      
-      if (result.error) {
-        throw new Error(`API Error: ${result.error}`);
-      }
-      
-      if (result.text && result.text.trim()) {
+      console.log('📝 Transcription result:', result);
+
+      if (result.text && result.text.trim().length > 0) {
         const trimmedText = result.text.trim();
-        const MIN_TEXT_LENGTH = 3; // Minimum number of words to consider valid
-        const wordCount = trimmedText.split(/\s+/).length;
+        const MIN_TEXT_LENGTH = 3; // Minimum characters to consider valid transcription
         
-        if (wordCount < MIN_TEXT_LENGTH) {
-          console.log('📏 Text too short, skipping:', {
+        if (trimmedText.length < MIN_TEXT_LENGTH) {
+          console.log('⏭️ Skipping short transcription:', {
             text: trimmedText,
-            wordCount: wordCount,
+            length: trimmedText.length,
             minRequired: MIN_TEXT_LENGTH
           });
           return; // Skip short transcriptions (likely noise)
@@ -223,11 +268,39 @@ export default function TranscribePage() {
           text: trimmedText,
           translatedText: result.translatedText || '',
           language: result.language || 'unknown',
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          translationService: result.translationService || 'unknown',
+          serverLatency: result.serverLatency
         };
         
-        console.log('📝 Adding transcription:', newTranscription);
-        setTranscriptions(prev => [...prev, newTranscription]);
+        console.log('📝 Processing transcription chunk:', newTranscription);
+        
+        // Simple merging logic: if we have a current transcript less than 3 seconds old, merge it
+        const now = Date.now();
+        const MERGE_WINDOW_MS = 3000; // 3 seconds to merge chunks
+        
+        if (currentTranscript && (now - currentTranscript.timestamp) < MERGE_WINDOW_MS) {
+          // Merge with current transcript
+          console.log('🔄 Merging with current transcript');
+          const mergedText = currentTranscript.text + ' ' + newTranscription.text;
+          const mergedTranslation = (currentTranscript.translatedText || '') + ' ' + (newTranscription.translatedText || '');
+          
+          setCurrentTranscript({
+            ...newTranscription,
+            text: mergedText,
+            translatedText: mergedTranslation,
+            timestamp: now
+          });
+        } else {
+          // Finalize current transcript and start new one
+          if (currentTranscript) {
+            console.log('⏰ Finalizing current transcript and starting new');
+            setTranscriptions(prev => [...prev, currentTranscript]);
+          }
+          console.log('🆕 Starting new transcript');
+          setCurrentTranscript(newTranscription);
+        }
+        
         setAudioAnalysisStatus(''); // Clear status after successful transcription
       } else {
         console.log('⚠️ No text returned from transcription');
@@ -241,197 +314,19 @@ export default function TranscribePage() {
 
   const clearTranscriptions = () => {
     setTranscriptions([]);
+    setCurrentTranscript(null);
     setTestResults([]);
+    setScrollPosition(0); // Reset scroll position
   };
 
-  // Real API Testing with actual MP3 file
-  const runRealAPISpeedTest = async () => {
-    setIsTesting(true);
-    setError('');
-    setAudioAnalysisStatus('🔬 Starting real API speed test...');
+  // Calculate spacing based on time gap between transcriptions
+  const calculateTimeGapSpacing = (currentTimestamp: number, previousTimestamp?: number): number => {
+    if (!previousTimestamp) return 0;
     
-    try {
-      // Load the test audio file
-      const response = await fetch('/test-audio.mp3');
-      if (!response.ok) {
-        throw new Error('Could not load test audio file');
-      }
-      
-      const audioBuffer = await response.arrayBuffer();
-      console.log('📁 Loaded test audio:', (audioBuffer.byteLength / 1024).toFixed(1) + ' KB');
-      
-      // Test different chunk sizes with real API calls
-      const chunkSizes = [1.0, 1.5, 2.0, 3.0]; // seconds
-      const testResultsTemp: any[] = [];
-      
-      setAudioAnalysisStatus('🎯 Testing chunk sizes: 1.0s, 1.5s, 2.0s, 3.0s...');
-      
-      for (let i = 0; i < chunkSizes.length; i++) {
-        const chunkSize = chunkSizes[i];
-        console.log(`\n🔬 Testing ${chunkSize}s chunks...`);
-        setAudioAnalysisStatus(`🔬 Testing ${chunkSize}s chunks... (${i + 1}/${chunkSizes.length})`);
-        
-        try {
-          // Create a real audio chunk using Web Audio API
-          const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-          const audioBufferDecoded = await audioContext.decodeAudioData(audioBuffer.slice(0));
-          
-          // Extract chunk from beginning of audio
-          const chunkSamples = Math.floor(chunkSize * audioBufferDecoded.sampleRate);
-          const chunkBuffer = audioContext.createBuffer(
-            audioBufferDecoded.numberOfChannels,
-            chunkSamples,
-            audioBufferDecoded.sampleRate
-          );
-          
-          // Copy audio data for the chunk
-          for (let channel = 0; channel < audioBufferDecoded.numberOfChannels; channel++) {
-            const sourceData = audioBufferDecoded.getChannelData(channel);
-            const chunkData = chunkBuffer.getChannelData(channel);
-            for (let sample = 0; sample < chunkSamples && sample < sourceData.length; sample++) {
-              chunkData[sample] = sourceData[sample];
-            }
-          }
-          
-          // Convert chunk to blob (simplified - using original audio format)
-          const chunkStartByte = 0;
-          const chunkSizeBytes = Math.floor((audioBuffer.byteLength * chunkSize) / 28.55); // proportional to total duration
-          const chunkArrayBuffer = audioBuffer.slice(chunkStartByte, chunkStartByte + chunkSizeBytes);
-          const audioBlob = new Blob([chunkArrayBuffer], { type: 'audio/mp3' });
-          
-          console.log(`📦 Created ${chunkSize}s chunk:`, (audioBlob.size / 1024).toFixed(1) + ' KB');
-          
-          // Send through real API pipeline
-          const startTime = Date.now();
-          const result = await sendAudioForTranscriptionWithMetrics(audioBlob, chunkSize, i);
-          const endTime = Date.now();
-          
-          const testResult = {
-            chunkSize,
-            latency: endTime - startTime,
-            success: !!result,
-            transcription: result?.text || '',
-            translation: result?.translatedText || '',
-            error: result?.error || null,
-            chunkIndex: i,
-            timestamp: new Date().toISOString()
-          };
-          
-          testResultsTemp.push(testResult);
-          console.log(`✅ ${chunkSize}s test completed:`, testResult.latency + 'ms');
-          
-          // Add to transcriptions with test metrics
-          if (result && result.text) {
-            const newTranscription: TranscriptionResult = {
-              text: `[TEST ${chunkSize}s] ${result.text}`,
-              translatedText: result.translatedText,
-              language: result.language || 'en',
-              timestamp: Date.now(),
-              testMetrics: {
-                chunkSize,
-                latency: testResult.latency,
-                apiLatency: testResult.latency, // Same for now
-                chunkIndex: i
-              }
-            };
-            setTranscriptions(prev => [...prev, newTranscription]);
-          }
-          
-          // Small delay between tests
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          
-        } catch (chunkError) {
-          console.error(`❌ ${chunkSize}s chunk test failed:`, chunkError);
-          testResultsTemp.push({
-            chunkSize,
-            latency: 0,
-            success: false,
-            error: chunkError instanceof Error ? chunkError.message : 'Unknown error',
-            chunkIndex: i,
-            timestamp: new Date().toISOString()
-          });
-        }
-      }
-      
-      setTestResults(testResultsTemp);
-      
-      // Generate performance summary
-      const successfulTests = testResultsTemp.filter(t => t.success);
-      if (successfulTests.length > 0) {
-        const fastest = successfulTests.reduce((min, current) => 
-          current.latency < min.latency ? current : min
-        );
-        
-        setAudioAnalysisStatus(
-          `✅ Testing complete! Fastest: ${fastest.chunkSize}s chunks (${fastest.latency}ms) | ` +
-          `${successfulTests.length}/${testResultsTemp.length} tests successful`
-        );
-        
-        console.log('\n🏆 REAL API TEST RESULTS:');
-        successfulTests.forEach(test => {
-          console.log(`${test.chunkSize}s chunks: ${test.latency}ms`);
-        });
-        console.log(`\n🥇 Winner: ${fastest.chunkSize}s chunks at ${fastest.latency}ms`);
-      } else {
-        setAudioAnalysisStatus('❌ All tests failed - check console for details');
-      }
-      
-    } catch (error) {
-      console.error('❌ Real API speed test failed:', error);
-      setError(`Test failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      setAudioAnalysisStatus('❌ Test failed - see error above');
-    } finally {
-      setIsTesting(false);
-    }
-  };
-
-  // Enhanced sendAudioForTranscription with metrics
-  const sendAudioForTranscriptionWithMetrics = async (audioBlob: Blob, chunkSize?: number, chunkIndex?: number) => {
-    try {
-      const apiStartTime = Date.now();
-      
-      const formData = new FormData();
-      formData.append('audio', audioBlob, 'audio.mp3');
-
-      const response = await fetch('/api/transcribe', {
-        method: 'POST',
-        body: formData,
-      });
-
-      const apiEndTime = Date.now();
-      const apiLatency = apiEndTime - apiStartTime;
-
-      console.log(`📥 API response (${chunkSize}s chunk):`, {
-        status: response.status,
-        latency: apiLatency + 'ms'
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP ${response.status}: ${errorText}`);
-      }
-
-      const result = await response.json();
-      
-      if (result.error) {
-        throw new Error(`API Error: ${result.error}`);
-      }
-      
-      return {
-        ...result,
-        apiLatency,
-        chunkSize,
-        chunkIndex
-      };
-      
-    } catch (err) {
-      console.error('❌ API call failed:', err);
-      return {
-        error: err instanceof Error ? err.message : 'Unknown error',
-        chunkSize,
-        chunkIndex
-      };
-    }
+    const timeDiffSeconds = (currentTimestamp - previousTimestamp) / 1000;
+    // Convert time gap to pixels: 1 second = 20px of spacing
+    const spacing = Math.min(timeDiffSeconds * 20, 200); // Cap at 200px max spacing
+    return spacing;
   };
 
   // Simple authentication check - redirect if not coming from main page
@@ -464,19 +359,127 @@ export default function TranscribePage() {
         }}>
           Real-Time Translation
         </h1>
-        <button
-          onClick={clearTranscriptions}
-          style={{
-            padding: '0.5rem 1rem',
-            backgroundColor: '#333',
-            color: 'white',
-            border: '1px solid #555',
-            borderRadius: '4px',
-            cursor: 'pointer'
-          }}
-        >
-          Clear
-        </button>
+        
+        {/* Performance Mode Toggle */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <div style={{ color: 'white', fontSize: '0.9rem' }}>
+            Speed: 
+            <button
+              onClick={() => setPerformanceMode('standard')}
+              style={{
+                marginLeft: '0.5rem',
+                padding: '0.25rem 0.5rem',
+                backgroundColor: performanceMode === 'standard' ? '#2563eb' : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              Standard
+            </button>
+            <button
+              onClick={() => setPerformanceMode('optimized')}
+              style={{
+                marginLeft: '0.25rem',
+                padding: '0.25rem 0.5rem',
+                backgroundColor: performanceMode === 'optimized' ? '#16a34a' : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              OPTIMIZED ⚡
+            </button>
+          </div>
+          
+          {/* Transcription Service Toggle */}
+          <div style={{ color: 'white', fontSize: '0.9rem' }}>
+            Transcription: 
+            <button
+              onClick={() => setTranscriptionService('openai')}
+              style={{
+                marginLeft: '0.5rem',
+                padding: '0.25rem 0.5rem',
+                backgroundColor: transcriptionService === 'openai' ? '#2563eb' : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              OpenAI
+            </button>
+            <button
+              onClick={() => setTranscriptionService('local')}
+              style={{
+                marginLeft: '0.25rem',
+                padding: '0.25rem 0.5rem',
+                backgroundColor: transcriptionService === 'local' ? '#f59e0b' : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              Local ⚡
+            </button>
+          </div>
+
+          {/* Translation Service Toggle */}
+          <div style={{ color: 'white', fontSize: '0.9rem' }}>
+            Translator: 
+            <button
+              onClick={() => setTranslationService('gpt4')}
+              style={{
+                marginLeft: '0.5rem',
+                padding: '0.25rem 0.5rem',
+                backgroundColor: translationService === 'gpt4' ? '#2563eb' : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              GPT-4
+            </button>
+            <button
+              onClick={() => setTranslationService('google')}
+              style={{
+                marginLeft: '0.25rem',
+                padding: '0.25rem 0.5rem',
+                backgroundColor: translationService === 'google' ? '#16a34a' : '#374151',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              Google 🚀
+            </button>
+          </div>
+
+          <button
+            onClick={clearTranscriptions}
+            style={{
+              padding: '0.5rem 1rem',
+              backgroundColor: '#333',
+              color: 'white',
+              border: '1px solid #555',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            Clear
+          </button>
+        </div>
       </div>
 
       {/* Error Display */}
@@ -493,80 +496,233 @@ export default function TranscribePage() {
         </div>
       )}
 
-      {/* Transcription Display */}
-      <div 
-        ref={transcriptionAreaRef}
-        style={{ 
-          flex: 1,
-          backgroundColor: '#111',
-          border: '1px solid #333',
-          borderRadius: '8px',
-          padding: '1rem',
-          overflowY: 'auto',
-          marginBottom: '1rem',
-          color: 'white',
-          fontSize: '1.1rem',
-          lineHeight: '1.6'
-        }}
-      >
-        {transcriptions.length === 0 ? (
-          <div style={{ color: '#666', fontStyle: 'italic' }}>
-            Press "Start Listening" to begin real-time translation...
-          </div>
-        ) : (
-          transcriptions.map((transcription, index) => (
-            <div key={index} style={{ marginBottom: '1rem', padding: '0.75rem', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333' }}>
-              {/* Test Metrics Header (if available) */}
-              {transcription.testMetrics && (
-                <div style={{ 
-                  marginBottom: '0.5rem', 
-                  padding: '0.25rem 0.5rem', 
-                  backgroundColor: '#2563eb20', 
-                  borderRadius: '4px',
-                  fontSize: '0.7rem',
-                  color: '#60a5fa',
-                  border: '1px solid #2563eb40'
-                }}>
-                  🔬 Test #{transcription.testMetrics.chunkIndex + 1}: {transcription.testMetrics.chunkSize}s chunk | 
-                  Latency: {transcription.testMetrics.latency}ms | 
-                  API: {transcription.testMetrics.apiLatency}ms
-                </div>
-              )}
-              
-              {/* Original Text */}
-              <div style={{ marginBottom: '0.5rem' }}>
-                <span style={{ 
-                  color: transcription.language === 'en' ? '#4ade80' : '#fbbf24',
-                  fontSize: '0.8rem',
-                  marginRight: '0.5rem',
-                  fontWeight: 'bold'
-                }}>
-                  [{transcription.language === 'en' ? 'EN' : 'ES'}]
-                </span>
-                <span style={{ color: '#e5e5e5' }}>{transcription.text}</span>
-              </div>
-              
-              {/* Translated Text */}
-              {transcription.translatedText && (
-                <div style={{ 
-                  paddingLeft: '1rem', 
-                  borderLeft: '3px solid #374151',
-                  marginLeft: '1.5rem'
-                }}>
-                  <span style={{ 
-                    color: transcription.language === 'en' ? '#fbbf24' : '#4ade80',
-                    fontSize: '0.8rem',
-                    marginRight: '0.5rem',
-                    fontWeight: 'bold'
-                  }}>
-                    [{transcription.language === 'en' ? 'ES' : 'EN'}]
-                  </span>
-                  <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>{transcription.translatedText}</span>
-                </div>
-              )}
+      {/* Teleprompter Display - Dual Pane Layout */}
+      <div style={{ 
+        flex: 1,
+        display: 'flex',
+        gap: '1px',
+        marginBottom: '1rem',
+        backgroundColor: '#333', // Gap color between panes
+        borderRadius: '8px',
+        overflow: 'hidden'
+      }}>
+        {/* Left Pane - Original Text */}
+        <div 
+          ref={leftPaneRef}
+          style={{ 
+            flex: 1,
+            backgroundColor: '#111',
+            padding: '2rem 1rem',
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            color: 'white',
+            fontSize: '1.3rem',
+            lineHeight: '1.8',
+            fontFamily: 'monospace',
+            scrollbarWidth: 'none', // Firefox
+            msOverflowStyle: 'none' // IE/Edge
+          }}
+        >
+          <style>{`
+            div::-webkit-scrollbar { display: none; } /* Chrome/Safari */
+          `}</style>
+          
+          {transcriptions.length === 0 && !currentTranscript ? (
+            <div style={{ 
+              color: '#666', 
+              fontStyle: 'italic',
+              textAlign: 'center',
+              marginTop: '50%'
+            }}>
+              Original Text
+              <br />
+              <small style={{ fontSize: '0.8rem' }}>Press "Start Listening" to begin...</small>
             </div>
-          ))
-        )}
+          ) : (
+            <>
+              {/* Add spacer at top for teleprompter effect */}
+              <div style={{ height: '80vh' }}></div>
+              
+              {/* Show finalized transcripts */}
+              {transcriptions.map((transcription, index) => {
+                const prevTranscription = index > 0 ? transcriptions[index - 1] : undefined;
+                const timeGapSpacing = calculateTimeGapSpacing(
+                  transcription.timestamp, 
+                  prevTranscription?.timestamp
+                );
+                
+                return (
+                  <div key={`original-${index}`} style={{ marginBottom: timeGapSpacing }}>
+                    <div style={{ 
+                      padding: '1rem',
+                      backgroundColor: '#1a1a1a', 
+                      borderRadius: '6px',
+                      marginBottom: '2rem'
+                    }}>
+                      <div style={{ 
+                        color: transcription.language === 'en' ? '#4ade80' : '#fbbf24',
+                        fontSize: '0.9rem',
+                        marginBottom: '0.5rem',
+                        fontWeight: 'bold'
+                      }}>
+                        [{transcription.language?.toUpperCase() || 'UNKNOWN'}]
+                      </div>
+                      <div style={{ color: 'white' }}>
+                        {transcription.text}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              
+              {/* Show current (live updating) transcript */}
+              {currentTranscript && (
+                <div style={{ marginBottom: '2rem' }}>
+                  <div style={{ 
+                    padding: '1rem',
+                    backgroundColor: '#1a1a2e', 
+                    borderRadius: '6px',
+                    border: '2px solid #4ade80',
+                    position: 'relative'
+                  }}>
+                    <div style={{ 
+                      position: 'absolute',
+                      top: '0.5rem',
+                      right: '0.5rem',
+                      padding: '0.25rem 0.5rem',
+                      backgroundColor: '#16a34a',
+                      color: 'white',
+                      borderRadius: '12px',
+                      fontSize: '0.7rem',
+                      fontWeight: 'bold'
+                    }}>
+                      🔴 LIVE
+                    </div>
+                    
+                    <div style={{ 
+                      color: currentTranscript.language === 'en' ? '#4ade80' : '#fbbf24',
+                      fontSize: '0.9rem',
+                      marginBottom: '0.5rem',
+                      fontWeight: 'bold'
+                    }}>
+                      [{currentTranscript.language?.toUpperCase() || 'UNKNOWN'}]
+                    </div>
+                    <div style={{ color: 'white' }}>
+                      {currentTranscript.text}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Right Pane - Translated Text */}
+        <div 
+          ref={rightPaneRef}
+          style={{ 
+            flex: 1,
+            backgroundColor: '#111',
+            padding: '2rem 1rem',
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            color: 'white',
+            fontSize: '1.3rem',
+            lineHeight: '1.8',
+            fontFamily: 'monospace',
+            scrollbarWidth: 'none', // Firefox
+            msOverflowStyle: 'none' // IE/Edge
+          }}
+        >
+          {transcriptions.length === 0 && !currentTranscript ? (
+            <div style={{ 
+              color: '#666', 
+              fontStyle: 'italic',
+              textAlign: 'center',
+              marginTop: '50%'
+            }}>
+              Translated Text
+              <br />
+              <small style={{ fontSize: '0.8rem' }}>Press "Start Listening" to begin...</small>
+            </div>
+          ) : (
+            <>
+              {/* Add spacer at top for teleprompter effect */}
+              <div style={{ height: '80vh' }}></div>
+              
+              {/* Show finalized transcripts */}
+              {transcriptions.map((transcription, index) => {
+                const prevTranscription = index > 0 ? transcriptions[index - 1] : undefined;
+                const timeGapSpacing = calculateTimeGapSpacing(
+                  transcription.timestamp, 
+                  prevTranscription?.timestamp
+                );
+                
+                return (
+                  <div key={`translated-${index}`} style={{ marginBottom: timeGapSpacing }}>
+                    <div style={{ 
+                      padding: '1rem',
+                      backgroundColor: '#1a1a1a', 
+                      borderRadius: '6px',
+                      marginBottom: '2rem'
+                    }}>
+                      <div style={{ 
+                        color: transcription.language === 'en' ? '#fbbf24' : '#4ade80',
+                        fontSize: '0.9rem',
+                        marginBottom: '0.5rem',
+                        fontWeight: 'bold'
+                      }}>
+                        [{transcription.language === 'en' ? 'ES' : 'EN'}]
+                      </div>
+                      <div style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+                        {transcription.translatedText || 'Translating...'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              
+              {/* Show current (live updating) transcript */}
+              {currentTranscript && (
+                <div style={{ marginBottom: '2rem' }}>
+                  <div style={{ 
+                    padding: '1rem',
+                    backgroundColor: '#1a1a2e', 
+                    borderRadius: '6px',
+                    border: '2px solid #4ade80',
+                    position: 'relative'
+                  }}>
+                    <div style={{ 
+                      position: 'absolute',
+                      top: '0.5rem',
+                      right: '0.5rem',
+                      padding: '0.25rem 0.5rem',
+                      backgroundColor: '#16a34a',
+                      color: 'white',
+                      borderRadius: '12px',
+                      fontSize: '0.7rem',
+                      fontWeight: 'bold'
+                    }}>
+                      🔴 LIVE
+                    </div>
+                    
+                    <div style={{ 
+                      color: currentTranscript.language === 'en' ? '#fbbf24' : '#4ade80',
+                      fontSize: '0.9rem',
+                      marginBottom: '0.5rem',
+                      fontWeight: 'bold'
+                    }}>
+                      [{currentTranscript.language === 'en' ? 'ES' : 'EN'}]
+                    </div>
+                    <div style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+                      {currentTranscript.translatedText || 'Translating...'}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
       </div>
 
       {/* Controls */}
@@ -593,24 +749,6 @@ export default function TranscribePage() {
         >
           {isLoading ? 'Starting...' : isListening ? 'Stop Listening' : 'Start Listening'}
         </button>
-        
-        <button
-          onClick={runRealAPISpeedTest}
-          disabled={isLoading || isListening || isTesting}
-          style={{
-            padding: '1rem 2rem',
-            fontSize: '1.1rem',
-            backgroundColor: isTesting ? '#dc2626' : '#2563eb',
-            color: 'white',
-            border: 'none',
-            borderRadius: '8px',
-            cursor: (isLoading || isListening || isTesting) ? 'not-allowed' : 'pointer',
-            minWidth: '200px',
-            opacity: (isLoading || isListening || isTesting) ? 0.7 : 1
-          }}
-        >
-          {isTesting ? 'Testing...' : '🔬 Test Speed (Real API)'}
-        </button>
       </div>
 
       {/* Status */}
@@ -618,12 +756,11 @@ export default function TranscribePage() {
         textAlign: 'center', 
         marginTop: '1rem',
         color: '#666',
-        fontSize: '0.9rem',
-        minHeight: '2rem'
+        fontSize: '0.9rem'
       }}>
         {isListening && (
-          <div style={{ color: '#16a34a' }}>
-            🎤 Listening... Recording in 1.5-second chunks (optimized for speed)
+          <div style={{ color: '#4ade80' }}>
+            🎤 Teleprompter Active - Scrolling at 20px/sec ({transcriptionService === 'local' ? 'Local Faster-Whisper' : 'OpenAI Whisper'})
           </div>
         )}
         {audioAnalysisStatus && (

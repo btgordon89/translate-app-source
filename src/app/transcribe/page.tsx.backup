@@ -1,0 +1,887 @@
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+
+interface TranscriptionResult {
+  text: string;
+  translatedText?: string;
+  language: string;
+  timestamp: number;
+  translationService?: string;
+  isTranslating?: boolean; // Progressive display: show when translation is in progress
+  serverLatency?: {
+    total: number;
+    whisper: number;
+    translation: number;
+  };
+  testMetrics?: {
+    chunkSize: number;
+    latency: number;
+    apiLatency: number;
+    chunkIndex: number;
+  };
+}
+
+export default function TranscribePage() {
+  const [isListening, setIsListening] = useState(false);
+  const [transcriptions, setTranscriptions] = useState<TranscriptionResult[]>([]);
+  const [currentTranscript, setCurrentTranscript] = useState<TranscriptionResult | null>(null);
+  const [error, setError] = useState<string>('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [audioAnalysisStatus, setAudioAnalysisStatus] = useState<string>('');
+  const [isTesting, setIsTesting] = useState(false);
+  const [testResults, setTestResults] = useState<any[]>([]);
+  const [translationService, setTranslationService] = useState<'gpt4' | 'google'>('google');
+  const [performanceMode, setPerformanceMode] = useState<'optimized' | 'standard'>('optimized');
+  const [lastChunkTime, setLastChunkTime] = useState<number>(0);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+  const transcriptionAreaRef = useRef<HTMLDivElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const processingQueueRef = useRef<Blob[]>([]);
+
+  // Auto-scroll to bottom when new transcriptions are added
+  useEffect(() => {
+    if (transcriptionAreaRef.current) {
+      transcriptionAreaRef.current.scrollTop = transcriptionAreaRef.current.scrollHeight;
+    }
+  }, [transcriptions, currentTranscript]);
+
+  // Calculate RMS (Root Mean Square) energy of audio data
+  const calculateAudioRMS = async (audioBlob: Blob): Promise<number> => {
+    try {
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      
+      // Get audio data from first channel
+      const channelData = audioBuffer.getChannelData(0);
+      
+      // Calculate RMS
+      let sumSquares = 0;
+      for (let i = 0; i < channelData.length; i++) {
+        sumSquares += channelData[i] * channelData[i];
+      }
+      const rms = Math.sqrt(sumSquares / channelData.length);
+      
+      // Convert to decibels (approximate)
+      const decibels = 20 * Math.log10(rms);
+      
+      console.log('🔊 Audio RMS Analysis:', {
+        rms: rms.toFixed(6),
+        decibels: decibels.toFixed(2) + ' dB',
+        duration: audioBuffer.duration.toFixed(2) + 's'
+      });
+      
+      audioContext.close();
+      return decibels;
+    } catch (error) {
+      console.error('❌ Error calculating audio RMS:', error);
+      return -60; // Default to low value if analysis fails
+    }
+  };
+
+  const startListening = async () => {
+    try {
+      setError('');
+      setIsLoading(true);
+
+      // Request microphone access
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          sampleRate: 16000
+        } 
+      });
+      
+      streamRef.current = stream;
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm; codecs=opus'
+      });
+      
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        if (audioChunksRef.current.length > 0) {
+          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+          
+          // Add to processing queue instead of processing immediately
+          processingQueueRef.current.push(audioBlob);
+          audioChunksRef.current = [];
+          
+          // Process queue if not already processing
+          if (!isProcessing) {
+            processAudioQueue();
+          }
+        }
+      };
+
+      // Record in 2-second chunks for optimal balance of speed and quality
+      mediaRecorder.start();
+      setIsListening(true);
+      setIsLoading(false);
+
+      // Set up interval to process audio chunks - balanced for UX and performance
+      const interval = setInterval(() => {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.stop();
+          mediaRecorderRef.current.start();
+        }
+      }, 2000); // 2 seconds - optimal balance between responsiveness and API efficiency
+
+      // Store interval for cleanup
+      (mediaRecorderRef.current as any).intervalId = interval;
+
+    } catch (err) {
+      console.error('Error starting audio recording:', err);
+      setError('Failed to access microphone. Please ensure microphone permissions are granted.');
+      setIsLoading(false);
+    }
+  };
+
+  const stopListening = () => {
+    if (mediaRecorderRef.current) {
+      const intervalId = (mediaRecorderRef.current as any).intervalId;
+      if (intervalId) {
+        clearInterval(intervalId);
+      }
+      
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current = null;
+    }
+    
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    
+    setIsListening(false);
+  };
+
+  const sendAudioForTranscription = async (audioBlob: Blob) => {
+    try {
+      console.log('📤 Analyzing audio chunk...', {
+        size: audioBlob.size,
+        type: audioBlob.type
+      });
+
+      // Calculate audio RMS to determine if chunk contains meaningful audio
+      const audioDecibels = await calculateAudioRMS(audioBlob);
+      const RMS_THRESHOLD = -45; // Minimum decibel level to process (adjust as needed)
+      
+      if (audioDecibels < RMS_THRESHOLD) {
+        console.log('🔇 Audio too quiet, skipping transcription:', {
+          decibels: audioDecibels.toFixed(2) + ' dB',
+          threshold: RMS_THRESHOLD + ' dB'
+        });
+        setAudioAnalysisStatus(`🔇 Audio too quiet (${audioDecibels.toFixed(1)} dB)`);
+        setTimeout(() => setAudioAnalysisStatus(''), 2000); // Clear after 2 seconds
+        return; // Skip this chunk - too quiet
+      }
+
+      console.log('✅ Audio above threshold, sending for transcription:', {
+        decibels: audioDecibels.toFixed(2) + ' dB',
+        threshold: RMS_THRESHOLD + ' dB'
+      });
+      setAudioAnalysisStatus(`🔊 Processing audio (${audioDecibels.toFixed(1)} dB)`);
+
+      const formData = new FormData();
+      formData.append('audio', audioBlob, 'audio.webm');
+
+      // Build optimized API URL based on performance mode
+      let apiUrl = `/api/transcribe?translator=${translationService}`;
+      if (performanceMode === 'optimized') {
+        apiUrl += '&format=text&language=en&temperature=0&optimize=true';
+      }
+      
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        body: formData,
+      });
+
+      console.log('📥 Transcription API response:', {
+        status: response.status,
+        statusText: response.statusText,
+        ok: response.ok
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ API Error Response:', errorText);
+        throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errorText}`);
+      }
+
+      const result = await response.json();
+      console.log('✅ Transcription result:', result);
+      
+      if (result.error) {
+        throw new Error(`API Error: ${result.error}`);
+      }
+      
+      if (result.text && result.text.trim()) {
+        const trimmedText = result.text.trim();
+        const MIN_TEXT_LENGTH = 3; // Minimum number of words to consider valid
+        const wordCount = trimmedText.split(/\s+/).length;
+        
+        if (wordCount < MIN_TEXT_LENGTH) {
+          console.log('📏 Text too short, skipping:', {
+            text: trimmedText,
+            wordCount: wordCount,
+            minRequired: MIN_TEXT_LENGTH
+          });
+          return; // Skip short transcriptions (likely noise)
+        }
+
+        const newTranscription: TranscriptionResult = {
+          text: trimmedText,
+          translatedText: result.translatedText || '',
+          language: result.language || 'unknown',
+          timestamp: Date.now(),
+          translationService: result.translationService || 'unknown',
+          serverLatency: result.serverLatency
+        };
+        
+        console.log('📝 Processing transcription chunk:', newTranscription);
+        
+        // Smart transcript merging logic
+        const now = Date.now();
+        const MERGE_WINDOW_MS = 3000; // 3 seconds to merge chunks into same transcript
+        const FINALIZE_DELAY_MS = 2000; // 2 seconds of silence to finalize current transcript
+        
+        setCurrentTranscript(prev => {
+          // If no current transcript, start a new one
+          if (!prev) {
+            console.log('🆕 Starting new transcript');
+            return newTranscription;
+          }
+          
+          // If too much time has passed, finalize current and start new
+          if (now - prev.timestamp > MERGE_WINDOW_MS) {
+            console.log('⏰ Time gap detected, finalizing current transcript and starting new');
+            setTranscriptions(prevTranscripts => [...prevTranscripts, prev]);
+            return newTranscription;
+          }
+          
+          // Merge with current transcript
+          console.log('🔄 Merging with current transcript');
+          return {
+            ...prev,
+            text: mergeTranscriptText(prev.text, newTranscription.text),
+            translatedText: mergeTranscriptText(prev.translatedText || '', newTranscription.translatedText || ''),
+            timestamp: now, // Update timestamp to latest
+            serverLatency: newTranscription.serverLatency // Use latest latency info
+          };
+        });
+        
+        // Set up timer to finalize current transcript after silence
+        setLastChunkTime(now);
+        setTimeout(() => {
+          const currentTime = Date.now();
+          if (currentTime - lastChunkTime >= FINALIZE_DELAY_MS - 100) { // Small buffer
+            setCurrentTranscript(current => {
+              if (current && currentTime - current.timestamp >= FINALIZE_DELAY_MS - 100) {
+                console.log('🏁 Finalizing transcript after silence');
+                setTranscriptions(prev => [...prev, current]);
+                return null;
+              }
+              return current;
+            });
+          }
+        }, FINALIZE_DELAY_MS);
+        
+        setAudioAnalysisStatus(''); // Clear status after successful transcription
+      } else {
+        console.log('⚠️ No text returned from transcription');
+      }
+    } catch (err) {
+      console.error('❌ Error transcribing audio:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      setError(`Transcription failed: ${errorMessage}`);
+    }
+  };
+
+  const clearTranscriptions = () => {
+    setTranscriptions([]);
+    setCurrentTranscript(null);
+    setTestResults([]);
+    processingQueueRef.current = []; // Clear processing queue too
+  };
+
+  // Process audio queue sequentially to prevent overlapping API calls
+  const processAudioQueue = async () => {
+    if (isProcessing || processingQueueRef.current.length === 0) {
+      return;
+    }
+
+    setIsProcessing(true);
+    
+    while (processingQueueRef.current.length > 0) {
+      const audioBlob = processingQueueRef.current.shift();
+      if (audioBlob) {
+        await sendAudioForTranscription(audioBlob);
+        
+        // Small delay between processing chunks to prevent overwhelming the API
+        if (processingQueueRef.current.length > 0) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+    }
+    
+    setIsProcessing(false);
+  };
+
+  // Helper function to intelligently merge transcript text
+  const mergeTranscriptText = (existingText: string, newText: string): string => {
+    if (!existingText) return newText;
+    if (!newText) return existingText;
+    
+    // Remove common prefixes/suffixes to avoid duplication
+    const words1 = existingText.trim().split(/\s+/);
+    const words2 = newText.trim().split(/\s+/);
+    
+    // Find overlap at the end of existing text and start of new text
+    let overlapLength = 0;
+    const maxOverlap = Math.min(words1.length, words2.length, 5); // Max 5 words overlap
+    
+    for (let i = 1; i <= maxOverlap; i++) {
+      const suffix = words1.slice(-i).join(' ').toLowerCase();
+      const prefix = words2.slice(0, i).join(' ').toLowerCase();
+      if (suffix === prefix) {
+        overlapLength = i;
+      }
+    }
+    
+    // Merge texts, removing overlap
+    const mergedWords = [...words1, ...words2.slice(overlapLength)];
+    const merged = mergedWords.join(' ');
+    
+    console.log('🔄 Text merge:', {
+      existing: existingText,
+      new: newText,
+      overlap: overlapLength,
+      result: merged
+    });
+    
+    return merged;
+  };
+
+  // Simulate real microphone input using test audio file
+  const simulateRealSpeaking = async () => {
+    const testId = Math.random().toString(36).substring(7);
+    console.log(`🎤 [${testId}] === SIMULATING 10-SECOND SPEAKING SESSION ===`);
+    
+    setIsTesting(true);
+    setError('');
+    setAudioAnalysisStatus('🎤 Starting 10-second simulation...');
+    
+    try {
+      console.log(`📁 [${testId}] Loading test audio file...`);
+      // Load the test audio file
+      const response = await fetch('/test-audio.mp3');
+      if (!response.ok) {
+        throw new Error(`Could not load test audio file: ${response.status} ${response.statusText}`);
+      }
+      
+      const audioBuffer = await response.arrayBuffer();
+      console.log(`📁 [${testId}] Loaded test audio:`, {
+        sizeKB: (audioBuffer.byteLength / 1024).toFixed(1) + ' KB',
+        sizeBytes: audioBuffer.byteLength
+      });
+
+      // Simulate chunking exactly like real microphone input
+      const CHUNK_INTERVAL_MS = 1500; // Same as real listening (1.5 seconds)
+      const SIMULATION_DURATION_MS = 10000; // 10 seconds total
+      const totalChunks = Math.ceil(SIMULATION_DURATION_MS / CHUNK_INTERVAL_MS);
+
+      console.log(`⏱️ [${testId}] Simulating ${totalChunks} chunks over 10 seconds using ${CHUNK_INTERVAL_MS}ms intervals`);
+      setAudioAnalysisStatus(`🎤 Simulating real speaking: ${totalChunks} chunks over 10 seconds...`);
+
+      // Process chunks sequentially like real microphone
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        const chunkStartTime = chunkIndex * CHUNK_INTERVAL_MS;
+        console.log(`\n📦 [${testId}] Processing chunk ${chunkIndex + 1}/${totalChunks} (${chunkStartTime}ms - ${chunkStartTime + CHUNK_INTERVAL_MS}ms)`);
+        
+        try {
+          // Create audio chunk from the test file (cycling through the audio if needed)
+          const audioBlob = await createAudioChunkFromFile(audioBuffer, chunkIndex, CHUNK_INTERVAL_MS, testId);
+          
+          // Feed through EXACT same pipeline as real microphone
+          await sendAudioForTranscription(audioBlob);
+          
+          // Wait for the chunk interval (simulating real-time)
+          if (chunkIndex < totalChunks - 1) {
+            console.log(`⏳ [${testId}] Waiting ${CHUNK_INTERVAL_MS}ms before next chunk...`);
+            await new Promise(resolve => setTimeout(resolve, CHUNK_INTERVAL_MS));
+          }
+          
+        } catch (chunkError) {
+          console.error(`❌ [${testId}] Chunk ${chunkIndex + 1} failed:`, chunkError);
+        }
+      }
+      
+      setAudioAnalysisStatus(`✅ 10-second simulation complete! Processed ${totalChunks} chunks.`);
+      console.log(`🏁 [${testId}] Simulation completed - processed ${totalChunks} chunks over 10 seconds`);
+      
+    } catch (error) {
+      console.error(`❌ [${testId}] Simulation failed:`, error);
+      setError(`Simulation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setAudioAnalysisStatus('❌ Simulation failed - see error above');
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  // Helper function to create audio chunks from test file
+  const createAudioChunkFromFile = async (audioBuffer: ArrayBuffer, chunkIndex: number, chunkDurationMs: number, testId: string): Promise<Blob> => {
+    try {
+      // Convert the audio buffer to simulate the same format as real microphone
+      const chunkStartByte = (chunkIndex * audioBuffer.byteLength * chunkDurationMs) / 28551; // 28.55 seconds is approximate duration
+      const chunkEndByte = Math.min(
+        chunkStartByte + (audioBuffer.byteLength * chunkDurationMs) / 28551,
+        audioBuffer.byteLength
+      );
+      
+      // If we've gone past the end, loop back to the beginning
+      let chunkArrayBuffer: ArrayBuffer;
+      if (chunkStartByte >= audioBuffer.byteLength) {
+        const loopStartByte = chunkStartByte % audioBuffer.byteLength;
+        chunkArrayBuffer = audioBuffer.slice(loopStartByte, Math.min(loopStartByte + (chunkEndByte - chunkStartByte), audioBuffer.byteLength));
+      } else if (chunkEndByte > audioBuffer.byteLength) {
+        // Chunk spans the end, need to wrap around
+        const firstPart = audioBuffer.slice(chunkStartByte, audioBuffer.byteLength);
+        const secondPart = audioBuffer.slice(0, chunkEndByte - audioBuffer.byteLength);
+        const combined = new Uint8Array(firstPart.byteLength + secondPart.byteLength);
+        combined.set(new Uint8Array(firstPart), 0);
+        combined.set(new Uint8Array(secondPart), firstPart.byteLength);
+        chunkArrayBuffer = combined.buffer;
+      } else {
+        chunkArrayBuffer = audioBuffer.slice(chunkStartByte, chunkEndByte);
+      }
+
+      const audioBlob = new Blob([chunkArrayBuffer], { type: 'audio/mp3' }); // Use mp3 format for OpenAI compatibility
+      
+      console.log(`📦 [${testId}] Created chunk ${chunkIndex + 1}:`, {
+        sizeKB: (audioBlob.size / 1024).toFixed(1) + ' KB',
+        sizeBytes: audioBlob.size,
+        durationMs: chunkDurationMs
+      });
+      
+      return audioBlob;
+    } catch (error) {
+      console.error(`❌ [${testId}] Failed to create chunk ${chunkIndex + 1}:`, error);
+      throw error;
+    }
+  };
+
+  // Simple authentication check - redirect if not coming from main page
+  useEffect(() => {
+    if (!document.referrer.includes(window.location.origin)) {
+      window.location.href = '/';
+    }
+  }, []);
+
+  return (
+    <div style={{ 
+      backgroundColor: 'black', 
+      height: '100vh', 
+      display: 'flex', 
+      flexDirection: 'column',
+      padding: '1rem',
+      fontFamily: 'monospace'
+    }}>
+      {/* Header */}
+      <div style={{ 
+        display: 'flex', 
+        justifyContent: 'space-between', 
+        alignItems: 'center',
+        marginBottom: '1rem'
+      }}>
+        <h1 style={{ 
+          color: 'white', 
+          fontSize: '1.5rem', 
+          margin: 0
+        }}>
+          Real-Time Translation
+        </h1>
+        
+        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+          {/* Translation Service Toggle */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.5rem',
+            backgroundColor: '#222',
+            borderRadius: '6px',
+            border: '1px solid #444'
+          }}>
+            <span style={{ color: '#888', fontSize: '0.8rem' }}>Translator:</span>
+            <button
+              onClick={() => setTranslationService('gpt4')}
+              disabled={isListening || isTesting}
+              style={{
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.75rem',
+                backgroundColor: translationService === 'gpt4' ? '#2563eb' : '#444',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: (isListening || isTesting) ? 'not-allowed' : 'pointer',
+                opacity: (isListening || isTesting) ? 0.5 : 1
+              }}
+            >
+              GPT-4
+            </button>
+            <button
+              onClick={() => setTranslationService('google')}
+              disabled={isListening || isTesting}
+              style={{
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.75rem',
+                backgroundColor: translationService === 'google' ? '#16a34a' : '#444',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: (isListening || isTesting) ? 'not-allowed' : 'pointer',
+                opacity: (isListening || isTesting) ? 0.5 : 1
+              }}
+            >
+              Google
+            </button>
+          </div>
+
+          {/* Performance Mode Toggle */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.5rem',
+            backgroundColor: '#222',
+            borderRadius: '6px',
+            border: '1px solid #444'
+          }}>
+            <span style={{ color: '#888', fontSize: '0.8rem' }}>Speed:</span>
+            <button
+              onClick={() => setPerformanceMode('standard')}
+              disabled={isListening || isTesting}
+              style={{
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.75rem',
+                backgroundColor: performanceMode === 'standard' ? '#6b7280' : '#444',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: (isListening || isTesting) ? 'not-allowed' : 'pointer',
+                opacity: (isListening || isTesting) ? 0.5 : 1
+              }}
+            >
+              Standard
+            </button>
+            <button
+              onClick={() => setPerformanceMode('optimized')}
+              disabled={isListening || isTesting}
+              style={{
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.75rem',
+                backgroundColor: performanceMode === 'optimized' ? '#10b981' : '#444',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: (isListening || isTesting) ? 'not-allowed' : 'pointer',
+                opacity: (isListening || isTesting) ? 0.5 : 1
+              }}
+            >
+              OPTIMIZED ⚡
+            </button>
+          </div>
+
+          <button
+            onClick={clearTranscriptions}
+            style={{
+              padding: '0.5rem 1rem',
+              backgroundColor: '#333',
+              color: 'white',
+              border: '1px solid #555',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+
+      {/* Error Display */}
+      {error && (
+        <div style={{ 
+          color: '#ff6b6b', 
+          marginBottom: '1rem',
+          padding: '0.5rem',
+          backgroundColor: '#2d1b1b',
+          borderRadius: '4px',
+          border: '1px solid #ff6b6b'
+        }}>
+          {error}
+        </div>
+      )}
+
+      {/* Transcription Display */}
+      <div 
+        ref={transcriptionAreaRef}
+        style={{ 
+          flex: 1,
+          backgroundColor: '#111',
+          border: '1px solid #333',
+          borderRadius: '8px',
+          padding: '1rem',
+          overflowY: 'auto',
+          marginBottom: '1rem',
+          color: 'white',
+          fontSize: '1.1rem',
+          lineHeight: '1.6'
+        }}
+      >
+        {transcriptions.length === 0 && !currentTranscript ? (
+          <div style={{ color: '#666', fontStyle: 'italic' }}>
+            Press "Start Listening" to begin real-time translation...
+          </div>
+        ) : (
+          <>
+            {/* Show finalized transcripts */}
+            {transcriptions.map((transcription, index) => (
+            <div key={index} style={{ marginBottom: '1rem', padding: '0.75rem', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333' }}>
+              {/* Translation Service & Performance Info */}
+              <div style={{ 
+                marginBottom: '0.5rem', 
+                padding: '0.25rem 0.5rem', 
+                backgroundColor: transcription.translationService === 'google' ? '#16a34a20' : '#2563eb20', 
+                borderRadius: '4px',
+                fontSize: '0.7rem',
+                color: transcription.translationService === 'google' ? '#4ade80' : '#60a5fa',
+                border: `1px solid ${transcription.translationService === 'google' ? '#16a34a40' : '#2563eb40'}`
+              }}>
+                🔄 {transcription.translationService?.toUpperCase() || 'UNKNOWN'} | 
+                {transcription.serverLatency && (
+                  <>
+                    Total: {transcription.serverLatency.total}ms | 
+                    Translation: {transcription.serverLatency.translation}ms
+                  </>
+                )}
+              </div>
+              
+              {/* Test Metrics Header (if available) */}
+              {transcription.testMetrics && (
+                <div style={{ 
+                  marginBottom: '0.5rem', 
+                  padding: '0.25rem 0.5rem', 
+                  backgroundColor: '#f59e0b20', 
+                  borderRadius: '4px',
+                  fontSize: '0.7rem',
+                  color: '#fbbf24',
+                  border: '1px solid #f59e0b40'
+                }}>
+                  🔬 Test #{transcription.testMetrics.chunkIndex + 1}: {transcription.testMetrics.chunkSize}s chunk | 
+                  Latency: {transcription.testMetrics.latency}ms | 
+                  API: {transcription.testMetrics.apiLatency}ms
+                </div>
+              )}
+              
+              {/* Original Text */}
+              <div style={{ marginBottom: '0.5rem' }}>
+                <span style={{ 
+                  color: transcription.language === 'en' ? '#4ade80' : '#fbbf24',
+                  fontSize: '0.8rem',
+                  marginRight: '0.5rem',
+                  fontWeight: 'bold'
+                }}>
+                  [{transcription.language === 'en' ? 'EN' : 'ES'}]
+                </span>
+                <span style={{ color: '#e5e5e5' }}>{transcription.text}</span>
+              </div>
+              
+              {/* Translated Text */}
+              {transcription.translatedText && (
+                <div style={{ 
+                  paddingLeft: '1rem', 
+                  borderLeft: '3px solid #374151',
+                  marginLeft: '1.5rem'
+                }}>
+                  <span style={{ 
+                    color: transcription.language === 'en' ? '#fbbf24' : '#4ade80',
+                    fontSize: '0.8rem',
+                    marginRight: '0.5rem',
+                    fontWeight: 'bold'
+                  }}>
+                    [{transcription.language === 'en' ? 'ES' : 'EN'}]
+                  </span>
+                  <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>{transcription.translatedText}</span>
+                </div>
+              )}
+            </div>
+          ))
+            
+            {/* Show current (live updating) transcript */}
+            {currentTranscript && (
+              <div style={{ 
+                marginBottom: '1rem', 
+                padding: '0.75rem', 
+                backgroundColor: '#1a1a2e', 
+                borderRadius: '6px', 
+                border: '2px solid #4ade80',
+                position: 'relative'
+              }}>
+                {/* Live indicator */}
+                <div style={{ 
+                  position: 'absolute',
+                  top: '0.5rem',
+                  right: '0.5rem',
+                  padding: '0.25rem 0.5rem',
+                  backgroundColor: '#16a34a',
+                  color: 'white',
+                  borderRadius: '12px',
+                  fontSize: '0.7rem',
+                  fontWeight: 'bold',
+                  opacity: '0.8'
+                }}>
+                  🔴 LIVE
+                </div>
+
+                {/* Translation Service & Performance Info */}
+                <div style={{ 
+                  marginBottom: '0.5rem', 
+                  padding: '0.25rem 0.5rem', 
+                  backgroundColor: currentTranscript.translationService === 'google' ? '#16a34a20' : '#2563eb20', 
+                  borderRadius: '4px',
+                  fontSize: '0.7rem',
+                  color: currentTranscript.translationService === 'google' ? '#4ade80' : '#60a5fa',
+                  border: `1px solid ${currentTranscript.translationService === 'google' ? '#16a34a40' : '#2563eb40'}`
+                }}>
+                  🔄 {currentTranscript.translationService?.toUpperCase() || 'UNKNOWN'} | 
+                  {currentTranscript.serverLatency && (
+                    <>
+                      Total: {currentTranscript.serverLatency.total}ms | 
+                      Translation: {currentTranscript.serverLatency.translation}ms
+                    </>
+                  )}
+                </div>
+                
+                {/* Original Text */}
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <span style={{ 
+                    color: currentTranscript.language === 'en' ? '#4ade80' : '#fbbf24',
+                    fontSize: '0.8rem',
+                    marginRight: '0.5rem',
+                    fontWeight: 'bold'
+                  }}>
+                    [{currentTranscript.language?.toUpperCase() || 'UNKNOWN'}]
+                  </span>
+                  <span style={{ color: 'white' }}>{currentTranscript.text}</span>
+                </div>
+
+                {/* Translated Text */}
+                {currentTranscript.translatedText && (
+                  <div style={{ 
+                    color: '#a3a3a3',
+                    fontStyle: 'italic',
+                    paddingLeft: '2rem',
+                    borderLeft: '2px solid #4ade80'
+                  }}>
+                    <span style={{ 
+                      color: currentTranscript.language === 'en' ? '#fbbf24' : '#4ade80',
+                      fontSize: '0.8rem',
+                      marginRight: '0.5rem',
+                      fontWeight: 'bold'
+                    }}>
+                      [{currentTranscript.language === 'en' ? 'ES' : 'EN'}]
+                    </span>
+                    {currentTranscript.translatedText}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Controls */}
+      <div style={{ 
+        display: 'flex', 
+        gap: '1rem',
+        justifyContent: 'center',
+        flexWrap: 'wrap'
+      }}>
+        <button
+          onClick={isListening ? stopListening : startListening}
+          disabled={isLoading || isTesting}
+          style={{
+            padding: '1rem 2rem',
+            fontSize: '1.1rem',
+            backgroundColor: isListening ? '#dc2626' : '#16a34a',
+            color: 'white',
+            border: 'none',
+            borderRadius: '8px',
+            cursor: (isLoading || isTesting) ? 'not-allowed' : 'pointer',
+            minWidth: '200px',
+            opacity: (isLoading || isTesting) ? 0.7 : 1
+          }}
+        >
+          {isLoading ? 'Starting...' : isListening ? 'Stop Listening' : 'Start Listening'}
+        </button>
+        
+        <button
+          onClick={simulateRealSpeaking}
+          disabled={isLoading || isListening || isTesting}
+          style={{
+            padding: '1rem 2rem',
+            fontSize: '1.1rem',
+            backgroundColor: isTesting ? '#dc2626' : '#2563eb',
+            color: 'white',
+            border: 'none',
+            borderRadius: '8px',
+            cursor: (isLoading || isListening || isTesting) ? 'not-allowed' : 'pointer',
+            minWidth: '200px',
+            opacity: (isLoading || isListening || isTesting) ? 0.7 : 1
+          }}
+        >
+          {isTesting ? 'Simulating...' : '🎤 Simulate 10s Speaking'}
+        </button>
+      </div>
+
+      {/* Status */}
+      <div style={{ 
+        textAlign: 'center', 
+        marginTop: '1rem',
+        color: '#666',
+        fontSize: '0.9rem',
+        minHeight: '2rem'
+      }}>
+        {isListening && (
+          <div style={{ color: '#16a34a' }}>
+            🎤 Listening... Recording in 1.5-second chunks using {translationService.toUpperCase()} translator ({performanceMode} mode)
+          </div>
+        )}
+        {audioAnalysisStatus && (
+          <div style={{ 
+            color: audioAnalysisStatus.includes('too quiet') ? '#fbbf24' : '#3b82f6',
+            marginTop: '0.5rem',
+            fontSize: '0.8rem'
+          }}>
+            {audioAnalysisStatus}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
