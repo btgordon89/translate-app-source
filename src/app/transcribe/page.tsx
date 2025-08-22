@@ -51,7 +51,7 @@ export default function TranscribePage() {
     if (isListening) {
       // Start smooth upward scrolling when listening
       scrollIntervalRef.current = setInterval(() => {
-        setScrollPosition(prev => prev + 2); // Scroll up 2px every 100ms = 20px/second
+        setScrollPosition(prev => prev + 1); // Scroll up 1px every 100ms = 10px/second
       }, 100);
     } else {
       // Stop scrolling when not listening
@@ -275,9 +275,9 @@ export default function TranscribePage() {
         
         console.log('📝 Processing transcription chunk:', newTranscription);
         
-        // Simple merging logic: if we have a current transcript less than 3 seconds old, merge it
+        // Simple merging logic: if we have a current transcript less than 8 seconds old, merge it
         const now = Date.now();
-        const MERGE_WINDOW_MS = 3000; // 3 seconds to merge chunks
+        const MERGE_WINDOW_MS = 8000; // 8 seconds to merge chunks - longer for smoother flow
         
         if (currentTranscript && (now - currentTranscript.timestamp) < MERGE_WINDOW_MS) {
           // Merge with current transcript
@@ -542,7 +542,7 @@ export default function TranscribePage() {
           ) : (
             <>
               {/* Add spacer at top for teleprompter effect */}
-              <div style={{ height: '80vh' }}></div>
+              <div style={{ height: '150vh' }}></div>
               
               {/* Show finalized transcripts as flowing text */}
               {transcriptions.map((transcription, index) => {
@@ -636,7 +636,7 @@ export default function TranscribePage() {
           ) : (
             <>
               {/* Add spacer at top for teleprompter effect */}
-              <div style={{ height: '80vh' }}></div>
+              <div style={{ height: '150vh' }}></div>
               
               {/* Show finalized transcripts as flowing text */}
               {transcriptions.map((transcription, index) => {
@@ -736,7 +736,7 @@ export default function TranscribePage() {
       }}>
         {isListening && (
           <div style={{ color: '#4ade80' }}>
-            🎤 Teleprompter Active - Scrolling at 20px/sec ({transcriptionService === 'local' ? 'Local Faster-Whisper' : 'OpenAI Whisper'})
+            🎤 Teleprompter Active - Scrolling at 10px/sec ({transcriptionService === 'local' ? 'Local Faster-Whisper' : 'OpenAI Whisper'})
           </div>
         )}
         {audioAnalysisStatus && (
