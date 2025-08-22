@@ -51,8 +51,8 @@ export default function TranscribePage() {
     if (isListening) {
       // Start smooth upward scrolling when listening
       scrollIntervalRef.current = setInterval(() => {
-        setScrollPosition(prev => prev + 1); // Scroll up 1px every 50ms = 20px/second
-      }, 50);
+        setScrollPosition(prev => prev + 2); // Scroll up 2px every 100ms = 20px/second
+      }, 100);
     } else {
       // Stop scrolling when not listening
       if (scrollIntervalRef.current) {
@@ -520,7 +520,8 @@ export default function TranscribePage() {
             lineHeight: '1.8',
             fontFamily: 'monospace',
             scrollbarWidth: 'none', // Firefox
-            msOverflowStyle: 'none' // IE/Edge
+            msOverflowStyle: 'none', // IE/Edge
+            scrollBehavior: 'auto' // Disable smooth scrolling for teleprompter
           }}
         >
           <style>{`
@@ -543,7 +544,7 @@ export default function TranscribePage() {
               {/* Add spacer at top for teleprompter effect */}
               <div style={{ height: '80vh' }}></div>
               
-              {/* Show finalized transcripts */}
+              {/* Show finalized transcripts as flowing text */}
               {transcriptions.map((transcription, index) => {
                 const prevTranscription = index > 0 ? transcriptions[index - 1] : undefined;
                 const timeGapSpacing = calculateTimeGapSpacing(
@@ -552,24 +553,16 @@ export default function TranscribePage() {
                 );
                 
                 return (
-                  <div key={`original-${index}`} style={{ marginBottom: timeGapSpacing }}>
+                  <div key={`original-${index}`} style={{ 
+                    marginBottom: `${timeGapSpacing + 40}px`,
+                    paddingBottom: '20px',
+                    borderBottom: timeGapSpacing > 50 ? '1px solid #333' : 'none'
+                  }}>
                     <div style={{ 
-                      padding: '1rem',
-                      backgroundColor: '#1a1a1a', 
-                      borderRadius: '6px',
-                      marginBottom: '2rem'
+                      color: 'white',
+                      marginBottom: '8px'
                     }}>
-                      <div style={{ 
-                        color: transcription.language === 'en' ? '#4ade80' : '#fbbf24',
-                        fontSize: '0.9rem',
-                        marginBottom: '0.5rem',
-                        fontWeight: 'bold'
-                      }}>
-                        [{transcription.language?.toUpperCase() || 'UNKNOWN'}]
-                      </div>
-                      <div style={{ color: 'white' }}>
-                        {transcription.text}
-                      </div>
+                      {transcription.text}
                     </div>
                   </div>
                 );
@@ -577,39 +570,33 @@ export default function TranscribePage() {
               
               {/* Show current (live updating) transcript */}
               {currentTranscript && (
-                <div style={{ marginBottom: '2rem' }}>
+                <div style={{ 
+                  marginBottom: '40px',
+                  paddingBottom: '20px',
+                  position: 'relative'
+                }}>
                   <div style={{ 
-                    padding: '1rem',
-                    backgroundColor: '#1a1a2e', 
-                    borderRadius: '6px',
-                    border: '2px solid #4ade80',
-                    position: 'relative'
+                    position: 'absolute',
+                    left: '-60px',
+                    top: '0',
+                    padding: '4px 8px',
+                    backgroundColor: '#16a34a',
+                    color: 'white',
+                    borderRadius: '4px',
+                    fontSize: '0.6rem',
+                    fontWeight: 'bold'
                   }}>
-                    <div style={{ 
-                      position: 'absolute',
-                      top: '0.5rem',
-                      right: '0.5rem',
-                      padding: '0.25rem 0.5rem',
-                      backgroundColor: '#16a34a',
-                      color: 'white',
-                      borderRadius: '12px',
-                      fontSize: '0.7rem',
-                      fontWeight: 'bold'
-                    }}>
-                      🔴 LIVE
-                    </div>
-                    
-                    <div style={{ 
-                      color: currentTranscript.language === 'en' ? '#4ade80' : '#fbbf24',
-                      fontSize: '0.9rem',
-                      marginBottom: '0.5rem',
-                      fontWeight: 'bold'
-                    }}>
-                      [{currentTranscript.language?.toUpperCase() || 'UNKNOWN'}]
-                    </div>
-                    <div style={{ color: 'white' }}>
-                      {currentTranscript.text}
-                    </div>
+                    LIVE
+                  </div>
+                  
+                  <div style={{ 
+                    color: 'white',
+                    border: '1px solid #4ade80',
+                    borderRadius: '4px',
+                    padding: '10px',
+                    backgroundColor: 'rgba(74, 222, 128, 0.1)'
+                  }}>
+                    {currentTranscript.text}
                   </div>
                 </div>
               )}
@@ -631,7 +618,8 @@ export default function TranscribePage() {
             lineHeight: '1.8',
             fontFamily: 'monospace',
             scrollbarWidth: 'none', // Firefox
-            msOverflowStyle: 'none' // IE/Edge
+            msOverflowStyle: 'none', // IE/Edge
+            scrollBehavior: 'auto' // Disable smooth scrolling for teleprompter
           }}
         >
           {transcriptions.length === 0 && !currentTranscript ? (
@@ -650,7 +638,7 @@ export default function TranscribePage() {
               {/* Add spacer at top for teleprompter effect */}
               <div style={{ height: '80vh' }}></div>
               
-              {/* Show finalized transcripts */}
+              {/* Show finalized transcripts as flowing text */}
               {transcriptions.map((transcription, index) => {
                 const prevTranscription = index > 0 ? transcriptions[index - 1] : undefined;
                 const timeGapSpacing = calculateTimeGapSpacing(
@@ -659,24 +647,17 @@ export default function TranscribePage() {
                 );
                 
                 return (
-                  <div key={`translated-${index}`} style={{ marginBottom: timeGapSpacing }}>
+                  <div key={`translated-${index}`} style={{ 
+                    marginBottom: `${timeGapSpacing + 40}px`,
+                    paddingBottom: '20px',
+                    borderBottom: timeGapSpacing > 50 ? '1px solid #333' : 'none'
+                  }}>
                     <div style={{ 
-                      padding: '1rem',
-                      backgroundColor: '#1a1a1a', 
-                      borderRadius: '6px',
-                      marginBottom: '2rem'
+                      color: '#9ca3af', 
+                      fontStyle: 'italic',
+                      marginBottom: '8px'
                     }}>
-                      <div style={{ 
-                        color: transcription.language === 'en' ? '#fbbf24' : '#4ade80',
-                        fontSize: '0.9rem',
-                        marginBottom: '0.5rem',
-                        fontWeight: 'bold'
-                      }}>
-                        [{transcription.language === 'en' ? 'ES' : 'EN'}]
-                      </div>
-                      <div style={{ color: '#9ca3af', fontStyle: 'italic' }}>
-                        {transcription.translatedText || 'Translating...'}
-                      </div>
+                      {transcription.translatedText || 'Translating...'}
                     </div>
                   </div>
                 );
@@ -684,39 +665,34 @@ export default function TranscribePage() {
               
               {/* Show current (live updating) transcript */}
               {currentTranscript && (
-                <div style={{ marginBottom: '2rem' }}>
+                <div style={{ 
+                  marginBottom: '40px',
+                  paddingBottom: '20px',
+                  position: 'relative'
+                }}>
                   <div style={{ 
-                    padding: '1rem',
-                    backgroundColor: '#1a1a2e', 
-                    borderRadius: '6px',
-                    border: '2px solid #4ade80',
-                    position: 'relative'
+                    position: 'absolute',
+                    left: '-60px',
+                    top: '0',
+                    padding: '4px 8px',
+                    backgroundColor: '#16a34a',
+                    color: 'white',
+                    borderRadius: '4px',
+                    fontSize: '0.6rem',
+                    fontWeight: 'bold'
                   }}>
-                    <div style={{ 
-                      position: 'absolute',
-                      top: '0.5rem',
-                      right: '0.5rem',
-                      padding: '0.25rem 0.5rem',
-                      backgroundColor: '#16a34a',
-                      color: 'white',
-                      borderRadius: '12px',
-                      fontSize: '0.7rem',
-                      fontWeight: 'bold'
-                    }}>
-                      🔴 LIVE
-                    </div>
-                    
-                    <div style={{ 
-                      color: currentTranscript.language === 'en' ? '#fbbf24' : '#4ade80',
-                      fontSize: '0.9rem',
-                      marginBottom: '0.5rem',
-                      fontWeight: 'bold'
-                    }}>
-                      [{currentTranscript.language === 'en' ? 'ES' : 'EN'}]
-                    </div>
-                    <div style={{ color: '#9ca3af', fontStyle: 'italic' }}>
-                      {currentTranscript.translatedText || 'Translating...'}
-                    </div>
+                    LIVE
+                  </div>
+                  
+                  <div style={{ 
+                    color: '#9ca3af', 
+                    fontStyle: 'italic',
+                    border: '1px solid #4ade80',
+                    borderRadius: '4px',
+                    padding: '10px',
+                    backgroundColor: 'rgba(74, 222, 128, 0.1)'
+                  }}>
+                    {currentTranscript.translatedText || 'Translating...'}
                   </div>
                 </div>
               )}
