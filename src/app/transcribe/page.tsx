@@ -524,10 +524,6 @@ export default function TranscribePage() {
             scrollBehavior: 'auto' // Disable smooth scrolling for teleprompter
           }}
         >
-          <style>{`
-            div::-webkit-scrollbar { display: none; } /* Chrome/Safari */
-          `}</style>
-          
           {transcriptions.length === 0 && !currentTranscript ? (
             <div style={{ 
               color: '#666', 
